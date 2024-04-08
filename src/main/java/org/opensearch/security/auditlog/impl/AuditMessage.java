@@ -417,7 +417,7 @@ public final class AuditMessage {
                     } else {
                         auditInfo.put(REQUEST_BODY, requestBody);
                     }
-                } catch (IOException e) {
+                } catch (Exception e) {
                     auditInfo.put(REQUEST_BODY, "ERROR: Unable to generate request body");
                 }
             }

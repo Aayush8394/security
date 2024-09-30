@@ -36,6 +36,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.security.AccessController;
 import java.security.MessageDigest;
 import java.security.PrivilegedAction;
+import java.security.Provider;
 import java.security.Security;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -58,11 +59,11 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import com.google.common.collect.Lists;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.Weight;
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import org.opensearch.OpenSearchException;
 import org.opensearch.OpenSearchSecurityException;
@@ -108,6 +109,7 @@ import org.opensearch.extensions.ExtensionsManager;
 import org.opensearch.http.HttpServerTransport;
 import org.opensearch.http.HttpServerTransport.Dispatcher;
 import org.opensearch.http.netty4.ssl.SecureNetty4HttpServerTransport;
+import org.opensearch.identity.PluginSubject;
 import org.opensearch.identity.Subject;
 import org.opensearch.identity.noop.NoopSubject;
 import org.opensearch.index.IndexModule;
@@ -118,6 +120,7 @@ import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.ExtensionAwarePlugin;
 import org.opensearch.plugins.IdentityPlugin;
 import org.opensearch.plugins.MapperPlugin;
+import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SecureHttpTransportSettingsProvider;
 import org.opensearch.plugins.SecureSettingsFactory;
 import org.opensearch.plugins.SecureTransportSettingsProvider;
@@ -154,11 +157,16 @@ import org.opensearch.security.configuration.Salt;
 import org.opensearch.security.configuration.SecurityFlsDlsIndexSearcherWrapper;
 import org.opensearch.security.dlic.rest.api.Endpoint;
 import org.opensearch.security.dlic.rest.api.SecurityRestApiActions;
+import org.opensearch.security.dlic.rest.api.ssl.CertificatesActionType;
+import org.opensearch.security.dlic.rest.api.ssl.TransportCertificatesInfoNodesAction;
 import org.opensearch.security.dlic.rest.validation.PasswordValidator;
 import org.opensearch.security.filter.SecurityFilter;
 import org.opensearch.security.filter.SecurityRestFilter;
+import org.opensearch.security.hasher.PasswordHasher;
+import org.opensearch.security.hasher.PasswordHasherFactory;
 import org.opensearch.security.http.NonSslHttpServerTransport;
 import org.opensearch.security.http.XFFResolver;
+import org.opensearch.security.identity.NoopPluginSubject;
 import org.opensearch.security.identity.SecurityTokenManager;
 import org.opensearch.security.privileges.PrivilegesEvaluator;
 import org.opensearch.security.privileges.PrivilegesInterceptor;
@@ -173,6 +181,7 @@ import org.opensearch.security.rest.TenantInfoAction;
 import org.opensearch.security.securityconf.DynamicConfigFactory;
 import org.opensearch.security.setting.OpensearchDynamicSetting;
 import org.opensearch.security.setting.TransportPassiveAuthSetting;
+import org.opensearch.security.ssl.ExternalSecurityKeyStore;
 import org.opensearch.security.ssl.OpenSearchSecureSettingsFactory;
 import org.opensearch.security.ssl.OpenSearchSecuritySSLPlugin;
 import org.opensearch.security.ssl.SslExceptionHandler;
@@ -258,6 +267,7 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
     private volatile DlsFlsRequestValve dlsFlsValve = null;
     private volatile Salt salt;
     private volatile OpensearchDynamicSetting<Boolean> transportPassiveAuthSetting;
+    private volatile PasswordHasher passwordHasher;
 
     public static boolean isActionTraceEnabled() {
 
@@ -371,18 +381,14 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
         demoCertHashes.add("a2ce3f577a5031398c1b4f58761444d837b031d0aff7614f8b9b5e4a9d59dbd1"); // esnode
         demoCertHashes.add("cd708e8dc707ae065f7ad8582979764b497f062e273d478054ab2f49c5469c6"); // root-ca
 
-        final SecurityManager sm = System.getSecurityManager();
+        // updates correct sha256sum
+        demoCertHashes.add("a3556d6bb61f7bd63cb19b1c8d0078d30c12739dedb0455c5792ac8627782042"); // kirk
+        demoCertHashes.add("25e34a9a5d4f1dceed1666eb624397bf3fe5787a7133cd32838ace0381bce1f7"); // kirk-key
+        demoCertHashes.add("a2ce3f577a5031398c1b4f58761444d837b031d0aff7614f8b9b5e4a9d59dbd1"); // esnode
+        demoCertHashes.add("ba9c5a61065f7f6115188128ffbdaa18fca34562b78b811f082439e2bef1d282"); // esnode-key
+        demoCertHashes.add("bcd708e8dc707ae065f7ad8582979764b497f062e273d478054ab2f49c5469c6"); // root-ca
 
-        if (sm != null) {
-            sm.checkPermission(new SpecialPermission());
-        }
-
-        AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
-            if (Security.getProvider("BC") == null) {
-                Security.addProvider(new BouncyCastleProvider());
-            }
-            return null;
-        });
+        tryAddSecurityProvider();
 
         final String advancedModulesEnabledKey = ConfigConstants.SECURITY_ADVANCED_MODULES_ENABLED;
         if (settings.hasValue(advancedModulesEnabledKey)) {
@@ -428,6 +434,19 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
                     }
                 }
             }
+        }
+
+        try {
+            String maskingAlgorithmDefault = settings.get(ConfigConstants.SECURITY_MASKED_FIELDS_ALGORITHM_DEFAULT);
+            if (StringUtils.isNotEmpty(maskingAlgorithmDefault)) {
+                MessageDigest.getInstance(maskingAlgorithmDefault);
+            }
+        } catch (Exception ex) {
+            throw new OpenSearchSecurityException(
+                "JVM does not support algorithm for {}",
+                ex,
+                ConfigConstants.SECURITY_MASKED_FIELDS_ALGORITHM_DEFAULT
+            );
         }
 
         if (!client && !settings.getAsBoolean(ConfigConstants.SECURITY_ALLOW_UNSAFE_DEMOCERTIFICATES, false)) {
@@ -631,7 +650,8 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
                         Objects.requireNonNull(auditLog),
                         sks,
                         Objects.requireNonNull(userService),
-                        sslCertReloadEnabled
+                        sslCertReloadEnabled,
+                        passwordHasher
                     )
                 );
                 log.debug("Added {} rest handler(s)", handlers.size());
@@ -656,6 +676,10 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
         List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> actions = new ArrayList<>(1);
         if (!disabled && !SSLConfig.isSslOnlyMode()) {
             actions.add(new ActionHandler<>(ConfigUpdateAction.INSTANCE, TransportConfigUpdateAction.class));
+            // external storage does not support reload and does not provide SSL certs info
+            if (!ExternalSecurityKeyStore.hasExternalSslContext(settings)) {
+                actions.add(new ActionHandler<>(CertificatesActionType.INSTANCE, TransportCertificatesInfoNodesAction.class));
+            }
             actions.add(new ActionHandler<>(WhoAmIAction.INSTANCE, TransportWhoAmIAction.class));
         }
         return actions;
@@ -1083,7 +1107,9 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
 
         cr = ConfigurationRepository.create(settings, this.configPath, threadPool, localClient, clusterService, auditLog);
 
-        userService = new UserService(cs, cr, settings, localClient);
+        this.passwordHasher = PasswordHasherFactory.createPasswordHasher(settings);
+
+        userService = new UserService(cs, cr, passwordHasher, settings, localClient);
 
         final XFFResolver xffResolver = new XFFResolver(threadPool);
         backendRegistry = new BackendRegistry(settings, adminDns, xffResolver, auditLog, threadPool);
@@ -1091,8 +1117,6 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
 
         final CompatConfig compatConfig = new CompatConfig(environment, transportPassiveAuthSetting);
 
-        // DLS-FLS is enabled if not client and not disabled and not SSL only.
-        final boolean dlsFlsEnabled = !SSLConfig.isSslOnlyMode();
         evaluator = new PrivilegesEvaluator(
             clusterService,
             threadPool,
@@ -1103,7 +1127,6 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
             privilegesInterceptor,
             cih,
             irr,
-            dlsFlsEnabled,
             namedXContentRegistry.get()
         );
 
@@ -1129,7 +1152,7 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
             configPath,
             compatConfig
         );
-        dcf = new DynamicConfigFactory(cr, settings, configPath, localClient, threadPool, cih);
+        dcf = new DynamicConfigFactory(cr, settings, configPath, localClient, threadPool, cih, passwordHasher);
         dcf.registerDCFListener(backendRegistry);
         dcf.registerDCFListener(compatConfig);
         dcf.registerDCFListener(irr);
@@ -1141,6 +1164,9 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
         if (!(auditLog instanceof NullAuditLog)) {
             // Don't register if advanced modules is disabled in which case auditlog is instance of NullAuditLog
             dcf.registerDCFListener(auditLog);
+        }
+        if (dlsFlsValve instanceof DlsFlsValveImpl) {
+            dcf.registerDCFListener(dlsFlsValve);
         }
 
         cr.setDynamicConfigFactory(dcf);
@@ -1179,13 +1205,17 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
         components.add(si);
         components.add(dcf);
         components.add(userService);
+        components.add(passwordHasher);
+
+        if (!ExternalSecurityKeyStore.hasExternalSslContext(settings)) {
+            components.add(sks);
+        }
         final var allowDefaultInit = settings.getAsBoolean(SECURITY_ALLOW_DEFAULT_INIT_SECURITYINDEX, false);
         final var useClusterState = useClusterStateToInitSecurityConfig(settings);
         if (!SSLConfig.isSslOnlyMode() && !isDisabled(settings) && allowDefaultInit && useClusterState) {
             clusterService.addListener(cr);
         }
         return components;
-
     }
 
     @Override
@@ -1273,6 +1303,60 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
                 Function.identity(),
                 Property.NodeScope,
                 Property.Filtered,
+                Property.Final
+            )
+        );
+
+        settings.add(
+            Setting.simpleString(
+                ConfigConstants.SECURITY_PASSWORD_HASHING_ALGORITHM,
+                ConfigConstants.SECURITY_PASSWORD_HASHING_ALGORITHM_DEFAULT,
+                Property.NodeScope,
+                Property.Final
+            )
+        );
+
+        settings.add(
+            Setting.intSetting(
+                ConfigConstants.SECURITY_PASSWORD_HASHING_BCRYPT_ROUNDS,
+                ConfigConstants.SECURITY_PASSWORD_HASHING_BCRYPT_ROUNDS_DEFAULT,
+                Property.NodeScope,
+                Property.Final
+            )
+        );
+
+        settings.add(
+            Setting.simpleString(
+                ConfigConstants.SECURITY_PASSWORD_HASHING_BCRYPT_MINOR,
+                ConfigConstants.SECURITY_PASSWORD_HASHING_BCRYPT_MINOR_DEFAULT,
+                Property.NodeScope,
+                Property.Final
+            )
+        );
+
+        settings.add(
+            Setting.intSetting(
+                ConfigConstants.SECURITY_PASSWORD_HASHING_PBKDF2_ITERATIONS,
+                ConfigConstants.SECURITY_PASSWORD_HASHING_PBKDF2_ITERATIONS_DEFAULT,
+                Property.NodeScope,
+                Property.Final
+            )
+        );
+
+        settings.add(
+            Setting.intSetting(
+                ConfigConstants.SECURITY_PASSWORD_HASHING_PBKDF2_LENGTH,
+                ConfigConstants.SECURITY_PASSWORD_HASHING_PBKDF2_LENGTH_DEFAULT,
+                Property.NodeScope,
+                Property.Final
+            )
+        );
+
+        settings.add(
+            Setting.simpleString(
+                ConfigConstants.SECURITY_PASSWORD_HASHING_PBKDF2_FUNCTION,
+                ConfigConstants.SECURITY_PASSWORD_HASHING_PBKDF2_FUNCTION_DEFAULT,
+                Property.NodeScope,
                 Property.Final
             )
         );
@@ -1382,6 +1466,9 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
             );
             settings.add(
                 Setting.boolSetting(ConfigConstants.OPENDISTRO_SECURITY_AUDIT_ENABLE_TRANSPORT, true, Property.NodeScope, Property.Filtered)
+            );
+            settings.add(
+                Setting.simpleString(ConfigConstants.SECURITY_MASKED_FIELDS_ALGORITHM_DEFAULT, Property.NodeScope, Property.Filtered)
             );
             final List<String> disabledCategories = new ArrayList<String>(2);
             disabledCategories.add("AUTHENTICATED");
@@ -1499,6 +1586,50 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
             settings.add(
                 Setting.simpleString(
                     ConfigConstants.SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX + ConfigConstants.SECURITY_AUDIT_OPENSEARCH_TYPE,
+                    Property.NodeScope,
+                    Property.Filtered
+                )
+            );
+
+            // Internal OpenSearch DataStream
+            settings.add(
+                Setting.simpleString(
+                    ConfigConstants.SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX + ConfigConstants.SECURITY_AUDIT_OPENSEARCH_DATASTREAM_NAME,
+                    Property.NodeScope,
+                    Property.Filtered
+                )
+            );
+            settings.add(
+                Setting.boolSetting(
+                    ConfigConstants.SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX
+                        + ConfigConstants.SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_MANAGE,
+                    true,
+                    Property.NodeScope,
+                    Property.Filtered
+                )
+            );
+            settings.add(
+                Setting.simpleString(
+                    ConfigConstants.SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX
+                        + ConfigConstants.SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_NAME,
+                    Property.NodeScope,
+                    Property.Filtered
+                )
+            );
+            settings.add(
+                Setting.intSetting(
+                    ConfigConstants.SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX
+                        + ConfigConstants.SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_NUMBER_OF_SHARDS,
+                    1,
+                    Property.NodeScope,
+                    Property.Filtered
+                )
+            );
+            settings.add(
+                Setting.intSetting(
+                    ConfigConstants.SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX
+                        + ConfigConstants.SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_NUMBER_OF_REPLICAS,
+                    0,
                     Property.NodeScope,
                     Property.Filtered
                 )
@@ -2018,7 +2149,7 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
     }
 
     @Override
-    public Subject getSubject() {
+    public Subject getCurrentSubject() {
         // Not supported
         return new NoopSubject();
     }
@@ -2029,8 +2160,37 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin
     }
 
     @Override
+    public PluginSubject getPluginSubject(Plugin plugin) {
+        return new NoopPluginSubject(threadPool);
+    }
+
+    @Override
     public Optional<SecureSettingsFactory> getSecureSettingFactory(Settings settings) {
-        return Optional.of(new OpenSearchSecureSettingsFactory(threadPool, sks, sslExceptionHandler, securityRestHandler));
+        return Optional.of(new OpenSearchSecureSettingsFactory(threadPool, sks, evaluateSslExceptionHandler(), securityRestHandler));
+    }
+
+    @SuppressWarnings("removal")
+    private void tryAddSecurityProvider() {
+        final SecurityManager sm = System.getSecurityManager();
+
+        if (sm != null) {
+            sm.checkPermission(new SpecialPermission());
+        }
+
+        // Add provider if on the classpath.
+        AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+            if (Security.getProvider("BC") == null) {
+                try {
+                    Class<?> providerClass = Class.forName("org.bouncycastle.jce.provider.BouncyCastleProvider");
+                    Provider provider = (Provider) providerClass.getDeclaredConstructor().newInstance();
+                    Security.addProvider(provider);
+                    log.debug("Bouncy Castle Provider added");
+                } catch (Exception e) {
+                    log.debug("Bouncy Castle Provider could not be added", e);
+                }
+            }
+            return null;
+        });
     }
 
     public static class GuiceHolder implements LifecycleComponent {

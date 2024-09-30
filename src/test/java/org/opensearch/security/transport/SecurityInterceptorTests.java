@@ -12,8 +12,9 @@ package org.opensearch.security.transport;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -53,7 +54,8 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
 import static java.util.Collections.emptySet;
-import static org.junit.Assert.assertEquals;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
@@ -117,10 +119,13 @@ public class SecurityInterceptorTests {
     private Connection connection3;
     private DiscoveryNode otherRemoteNode;
     private Connection connection4;
+    private DiscoveryNode remoteNodeWithCustomSerialization;
+    private Connection connection5;
 
     private AsyncSender sender;
-    private AsyncSender serializedSender;
-    private AsyncSender nullSender;
+    private AsyncSender jdkSerializedSender;
+    private AsyncSender customSerializedSender;
+    private AtomicReference<CountDownLatch> senderLatch = new AtomicReference<>(new CountDownLatch(1));
 
     @Before
     public void setup() {
@@ -197,7 +202,14 @@ public class SecurityInterceptorTests {
         otherRemoteNode = new DiscoveryNode("remote-node2", new TransportAddress(remoteAddress, 9876), remoteNodeVersion);
         connection4 = transportService.getConnection(otherRemoteNode);
 
-        serializedSender = new AsyncSender() {
+        remoteNodeWithCustomSerialization = new DiscoveryNode(
+            "remote-node-with-custom-serialization",
+            new TransportAddress(localAddress, 7456),
+            Version.V_2_12_0
+        );
+        connection5 = transportService.getConnection(remoteNodeWithCustomSerialization);
+
+        jdkSerializedSender = new AsyncSender() {
             @Override
             public <T extends TransportResponse> void sendRequest(
                 Connection connection,
@@ -207,7 +219,24 @@ public class SecurityInterceptorTests {
                 TransportResponseHandler<T> handler
             ) {
                 String serializedUserHeader = threadPool.getThreadContext().getHeader(ConfigConstants.OPENDISTRO_SECURITY_USER_HEADER);
-                assertEquals(serializedUserHeader, Base64Helper.serializeObject(user, true));
+                User deserializedUser = (User) Base64Helper.deserializeObject(serializedUserHeader, true);
+                assertThat(deserializedUser, is(user));
+                senderLatch.get().countDown();
+            }
+        };
+
+        customSerializedSender = new AsyncSender() {
+            @Override
+            public <T extends TransportResponse> void sendRequest(
+                Connection connection,
+                String action,
+                TransportRequest request,
+                TransportRequestOptions options,
+                TransportResponseHandler<T> handler
+            ) {
+                String serializedUserHeader = threadPool.getThreadContext().getHeader(ConfigConstants.OPENDISTRO_SECURITY_USER_HEADER);
+                assertThat(serializedUserHeader, is(Base64Helper.serializeObject(user, false)));
+                senderLatch.get().countDown();
             }
         };
 
@@ -221,7 +250,8 @@ public class SecurityInterceptorTests {
                 TransportResponseHandler<T> handler
             ) {
                 User transientUser = threadPool.getThreadContext().getTransient(ConfigConstants.OPENDISTRO_SECURITY_USER);
-                assertEquals(transientUser, user);
+                assertThat(user, is(transientUser));
+                senderLatch.get().countDown();
             }
         };
 
@@ -235,7 +265,7 @@ public class SecurityInterceptorTests {
     final void verifyOriginalContext(User user) {
 
         User transientUser = threadPool.getThreadContext().getTransient(ConfigConstants.OPENDISTRO_SECURITY_USER);
-        assertEquals(transientUser, user);
+        assertThat(user, is(transientUser));
         assertNull(threadPool.getThreadContext().getHeader(ConfigConstants.OPENDISTRO_SECURITY_USER_HEADER));
     }
 
@@ -249,17 +279,37 @@ public class SecurityInterceptorTests {
         TransportResponseHandler handler,
         DiscoveryNode localNode
     ) {
+        securityInterceptor.sendRequestDecorate(sender, connection, action, request, options, handler, localNode);
+        verifyOriginalContext(user);
+        try {
+            senderLatch.get().await(1, TimeUnit.SECONDS);
+        } catch (final InterruptedException e) {
+            throw new RuntimeException(e);
+        }
 
-        ExecutorService singleThreadExecutor = Executors.newSingleThreadExecutor();
+        // Reset the latch so another request can be processed
+        senderLatch.set(new CountDownLatch(1));
+    }
 
-        singleThreadExecutor.execute(() -> {
-            try {
-                securityInterceptor.sendRequestDecorate(sender, connection, action, request, options, handler, localNode);
-                verifyOriginalContext(user);
-            } finally {
-                singleThreadExecutor.shutdown();
-            }
-        });
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    final void completableRequestDecorateWithPreviouslyPopulatedHeaders(
+        AsyncSender sender,
+        Connection connection,
+        String action,
+        TransportRequest request,
+        TransportRequestOptions options,
+        TransportResponseHandler handler,
+        DiscoveryNode localNode
+    ) {
+        securityInterceptor.sendRequestDecorate(sender, connection, action, request, options, handler, localNode);
+        try {
+            senderLatch.get().await(1, TimeUnit.SECONDS);
+        } catch (final InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+
+        // Reset the latch so another request can be processed
+        senderLatch.set(new CountDownLatch(1));
     }
 
     @Test
@@ -275,16 +325,44 @@ public class SecurityInterceptorTests {
     public void testSendRequestDecorateRemoteConnection() {
 
         // this is a remote request
-        completableRequestDecorate(serializedSender, connection3, action, request, options, handler, localNode);
+        completableRequestDecorate(jdkSerializedSender, connection3, action, request, options, handler, localNode);
         // this is a remote request where the transport address is different
-        completableRequestDecorate(serializedSender, connection4, action, request, options, handler, localNode);
+        completableRequestDecorate(jdkSerializedSender, connection4, action, request, options, handler, localNode);
+    }
+
+    @Test
+    public void testSendRequestDecorateRemoteConnectionUsesJDKSerialization() {
+        threadPool.getThreadContext().putHeader(ConfigConstants.OPENDISTRO_SECURITY_USER_HEADER, Base64Helper.serializeObject(user, false));
+        completableRequestDecorateWithPreviouslyPopulatedHeaders(
+            jdkSerializedSender,
+            connection3,
+            action,
+            request,
+            options,
+            handler,
+            localNode
+        );
+    }
+
+    @Test
+    public void testSendRequestDecorateRemoteConnectionUsesCustomSerialization() {
+        threadPool.getThreadContext().putHeader(ConfigConstants.OPENDISTRO_SECURITY_USER_HEADER, Base64Helper.serializeObject(user, true));
+        completableRequestDecorateWithPreviouslyPopulatedHeaders(
+            customSerializedSender,
+            connection5,
+            action,
+            request,
+            options,
+            handler,
+            localNode
+        );
     }
 
     @Test
     public void testSendNoOriginNodeCausesSerialization() {
 
         // this is a request where the local node is null; have to use the remote connection since the serialization will fail
-        completableRequestDecorate(serializedSender, connection3, action, request, options, handler, null);
+        completableRequestDecorate(jdkSerializedSender, connection3, action, request, options, handler, null);
     }
 
     @Test
@@ -293,7 +371,7 @@ public class SecurityInterceptorTests {
         // The completable version swallows the NPE so have to call actual method
         assertThrows(
             java.lang.NullPointerException.class,
-            () -> securityInterceptor.sendRequestDecorate(serializedSender, null, action, request, options, handler, localNode)
+            () -> securityInterceptor.sendRequestDecorate(jdkSerializedSender, null, action, request, options, handler, localNode)
         );
     }
 
@@ -325,7 +403,7 @@ public class SecurityInterceptorTests {
                 ConfigConstants.OPENDISTRO_SECURITY_REMOTE_ADDRESS,
                 String.valueOf(new TransportAddress(new InetSocketAddress("8.8.8.8", 80)))
             );
-        completableRequestDecorate(serializedSender, connection3, action, request, options, handler, localNode);
+        completableRequestDecorate(jdkSerializedSender, connection3, action, request, options, handler, localNode);
     }
 
     @Test
@@ -348,7 +426,7 @@ public class SecurityInterceptorTests {
         // this is a local request
         completableRequestDecorate(sender, connection1, action, request, options, handler, localNode);
         // this is a remote request
-        completableRequestDecorate(serializedSender, connection3, action, request, options, handler, localNode);
+        completableRequestDecorate(jdkSerializedSender, connection3, action, request, options, handler, localNode);
     }
 
     @Test
@@ -360,7 +438,7 @@ public class SecurityInterceptorTests {
         // this is a local request
         completableRequestDecorate(sender, connection1, action, request, options, handler, localNode);
         // this is a remote request
-        completableRequestDecorate(serializedSender, connection3, action, request, options, handler, localNode);
+        completableRequestDecorate(jdkSerializedSender, connection3, action, request, options, handler, localNode);
     }
 
     @Test

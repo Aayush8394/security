@@ -17,16 +17,18 @@ import java.util.Map;
 
 import org.junit.Before;
 import org.junit.Test;
-import org.bouncycastle.crypto.generators.OpenBSDBCrypt;
 
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.security.DefaultObjectMapper;
 import org.opensearch.security.dlic.rest.validation.ValidationResult;
+import org.opensearch.security.hasher.PasswordHasherFactory;
 import org.opensearch.security.securityconf.impl.CType;
 import org.opensearch.security.securityconf.impl.SecurityDynamicConfiguration;
 import org.opensearch.security.securityconf.impl.v7.InternalUserV7;
 import org.opensearch.security.securityconf.impl.v7.RoleV7;
+import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.user.UserService;
 import org.opensearch.security.util.FakeRestRequest;
 
@@ -36,7 +38,7 @@ import org.mockito.Mockito;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsString;
-import static org.junit.Assert.assertEquals;
+import static org.hamcrest.Matchers.is;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -58,7 +60,6 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
         allClusterPermissions.setCluster_permissions(List.of("*"));
         @SuppressWarnings("unchecked")
         final var c = (SecurityDynamicConfiguration<RoleV7>) rolesConfiguration;
-        c.putCEntry("some_role_with_static_mapping", allClusterPermissions);
         c.putCEntry("some_role_with_reserved_mapping", allClusterPermissions);
         c.putCEntry("some_role_with_hidden_mapping", allClusterPermissions);
 
@@ -70,13 +71,12 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
         config.set("all_access", objectMapper.createObjectNode());
         config.set("regular_role", objectMapper.createObjectNode());
 
-        config.set("some_role_with_static_mapping", objectMapper.createObjectNode().put("static", true));
         config.set("some_role_with_reserved_mapping", objectMapper.createObjectNode().put("reserved", true));
         config.set("some_role_with_hidden_mapping", objectMapper.createObjectNode().put("hidden", true));
 
         final var rolesMappingConfiguration = SecurityDynamicConfiguration.fromJson(
             objectMapper.writeValueAsString(config),
-            CType.ROLES,
+            CType.ROLESMAPPING,
             2,
             1,
             1
@@ -95,10 +95,10 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
             configuration
         );
         final var result = internalUsersApiActionEndpointValidator.onConfigChange(securityConfiguration);
-        assertEquals(RestStatus.OK, result.status());
+        assertThat(result.status(), is(RestStatus.OK));
         assertFalse(securityConfiguration.requestContent().has("password"));
         assertTrue(securityConfiguration.requestContent().has("hash"));
-        assertTrue(OpenBSDBCrypt.checkPassword(securityConfiguration.requestContent().get("hash").asText(), "aaaaaa".toCharArray()));
+        assertTrue(passwordHasher.check("aaaaaa".toCharArray(), securityConfiguration.requestContent().get("hash").asText()));
     }
 
     @Test
@@ -112,7 +112,7 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
                 .build()
         );
         assertFalse(result.isValid());
-        assertEquals(RestStatus.NOT_IMPLEMENTED, result.status());
+        assertThat(result.status(), is(RestStatus.NOT_IMPLEMENTED));
 
         result = internalUsersApiAction.withAuthTokenPath(
             FakeRestRequest.builder()
@@ -122,7 +122,7 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
                 .build()
         );
         assertTrue(result.isValid());
-        assertEquals(RestStatus.OK, result.status());
+        assertThat(result.status(), is(RestStatus.OK));
     }
 
     @Test
@@ -140,7 +140,7 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
             SecurityConfiguration.of(objectMapper.createObjectNode(), "aaaa", configuration)
         );
         assertFalse(result.isValid());
-        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, result.status());
+        assertThat(result.status(), is(RestStatus.INTERNAL_SERVER_ERROR));
     }
 
     @Test
@@ -185,15 +185,18 @@ public class InternalUsersApiActionValidationTest extends AbstractApiActionValid
             .set("opendistro_security_roles", objectMapper.createArrayNode().add("some_role_with_reserved_mapping"));
         result = internalUsersApiAction.validateSecurityRoles(SecurityConfiguration.of(userJson, "some_user", configuration));
         assertFalse(result.isValid());
-        // should not be ok to set role with static role mapping
-        userJson = objectMapper.createObjectNode()
-            .set("opendistro_security_roles", objectMapper.createArrayNode().add("some_role_with_static_mapping"));
-        result = internalUsersApiAction.validateSecurityRoles(SecurityConfiguration.of(userJson, "some_user", configuration));
-        assertFalse(result.isValid());
     }
 
     private InternalUsersApiAction createInternalUsersApiAction() {
-        return new InternalUsersApiAction(clusterService, threadPool, userService, securityApiDependencies);
+        return new InternalUsersApiAction(
+            clusterService,
+            threadPool,
+            userService,
+            securityApiDependencies,
+            PasswordHasherFactory.createPasswordHasher(
+                Settings.builder().put(ConfigConstants.SECURITY_PASSWORD_HASHING_ALGORITHM, ConfigConstants.BCRYPT).build()
+            )
+        );
     }
 
 }

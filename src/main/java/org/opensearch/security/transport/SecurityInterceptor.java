@@ -39,6 +39,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsAction;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsResponse;
 import org.opensearch.action.get.GetRequest;
@@ -62,6 +63,7 @@ import org.opensearch.security.ssl.transport.SSLConfig;
 import org.opensearch.security.support.Base64Helper;
 import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.support.HeaderHelper;
+import org.opensearch.security.support.SerializationFormat;
 import org.opensearch.security.user.User;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.Transport.Connection;
@@ -150,7 +152,8 @@ public class SecurityInterceptor {
         final String origCCSTransientMf = getThreadContext().getTransient(ConfigConstants.OPENDISTRO_SECURITY_MASKED_FIELD_CCS);
 
         final boolean isDebugEnabled = log.isDebugEnabled();
-        final boolean useJDKSerialization = connection.getVersion().before(ConfigConstants.FIRST_CUSTOM_SERIALIZATION_SUPPORTED_OS_VERSION);
+
+        final var serializationFormat = SerializationFormat.determineFormat(connection.getVersion());
         final boolean isSameNodeRequest = localNode != null && localNode.equals(connection.getNode());
 
         try (ThreadContext.StoredContext stashedContext = getThreadContext().stashContext()) {
@@ -228,16 +231,28 @@ public class SecurityInterceptor {
                 );
             }
 
-            if (useJDKSerialization) {
-                Map<String, String> jdkSerializedHeaders = new HashMap<>();
-                HeaderHelper.getAllSerializedHeaderNames()
-                    .stream()
-                    .filter(k -> headerMap.get(k) != null)
-                    .forEach(k -> jdkSerializedHeaders.put(k, Base64Helper.ensureJDKSerialized(headerMap.get(k))));
-                headerMap.putAll(jdkSerializedHeaders);
+            try {
+                if (clusterInfoHolder.getMinNodeVersion() == null || clusterInfoHolder.getMinNodeVersion().before(Version.V_2_14_0)) {
+                    if (serializationFormat == SerializationFormat.JDK) {
+                        Map<String, String> jdkSerializedHeaders = new HashMap<>();
+                        HeaderHelper.getAllSerializedHeaderNames()
+                            .stream()
+                            .filter(k -> headerMap.get(k) != null)
+                            .forEach(k -> jdkSerializedHeaders.put(k, Base64Helper.ensureJDKSerialized(headerMap.get(k))));
+                        headerMap.putAll(jdkSerializedHeaders);
+                    } else if (serializationFormat == SerializationFormat.CustomSerializer_2_11) {
+                        Map<String, String> customSerializedHeaders = new HashMap<>();
+                        HeaderHelper.getAllSerializedHeaderNames()
+                            .stream()
+                            .filter(k -> headerMap.get(k) != null)
+                            .forEach(k -> customSerializedHeaders.put(k, Base64Helper.ensureCustomSerialized(headerMap.get(k))));
+                        headerMap.putAll(customSerializedHeaders);
+                    }
+                }
+                getThreadContext().putHeader(headerMap);
+            } catch (IllegalArgumentException iae) {
+                log.debug("Failed to add headers information onto on thread context", iae);
             }
-
-            getThreadContext().putHeader(headerMap);
 
             ensureCorrectHeaders(
                 remoteAddress0,
@@ -246,7 +261,7 @@ public class SecurityInterceptor {
                 injectedUserString,
                 injectedRolesString,
                 isSameNodeRequest,
-                useJDKSerialization
+                serializationFormat
             );
 
             if (actionTraceEnabled.get()) {
@@ -275,7 +290,7 @@ public class SecurityInterceptor {
         final String injectedUserString,
         final String injectedRolesString,
         final boolean isSameNodeRequest,
-        final boolean useJDKSerialization
+        final SerializationFormat format
     ) {
         // keep original address
 
@@ -313,6 +328,7 @@ public class SecurityInterceptor {
                 getThreadContext().putTransient(ConfigConstants.OPENDISTRO_SECURITY_INJECTED_USER, injectedUserString);
             }
         } else {
+            final var useJDKSerialization = format == SerializationFormat.JDK;
             if (transportAddress != null) {
                 getThreadContext().putHeader(
                     ConfigConstants.OPENDISTRO_SECURITY_REMOTE_ADDRESS_HEADER,

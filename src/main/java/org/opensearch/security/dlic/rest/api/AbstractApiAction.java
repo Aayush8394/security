@@ -66,6 +66,7 @@ import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.user.User;
 import org.opensearch.threadpool.ThreadPool;
 
+import com.flipkart.zjsonpatch.JsonDiff;
 import com.flipkart.zjsonpatch.JsonPatch;
 import com.flipkart.zjsonpatch.JsonPatchApplicationException;
 
@@ -74,7 +75,7 @@ import static org.opensearch.security.dlic.rest.api.Responses.badRequestMessage;
 import static org.opensearch.security.dlic.rest.api.Responses.conflict;
 import static org.opensearch.security.dlic.rest.api.Responses.forbidden;
 import static org.opensearch.security.dlic.rest.api.Responses.forbiddenMessage;
-import static org.opensearch.security.dlic.rest.api.Responses.internalSeverError;
+import static org.opensearch.security.dlic.rest.api.Responses.internalServerError;
 import static org.opensearch.security.dlic.rest.api.Responses.payload;
 import static org.opensearch.security.dlic.rest.support.Utils.withIOException;
 
@@ -203,7 +204,7 @@ public abstract class AbstractApiAction extends BaseRestHandler {
                     final var entityAsJson = (ObjectNode) configurationAsJson.get(entityName);
                     return withJsonPatchException(
                         () -> endpointValidator.createRequestContentValidator(entityName)
-                            .validate(request, JsonPatch.apply(patchContent, entityAsJson))
+                            .validate(request, JsonPatch.apply(patchContent, entityAsJson), configurationAsJson.get(entityName))
                             .map(
                                 patchedEntity -> endpointValidator.onConfigChange(
                                     SecurityConfiguration.of(patchedEntity, entityName, configuration)
@@ -238,10 +239,14 @@ public abstract class AbstractApiAction extends BaseRestHandler {
         final var configurationAsJson = (ObjectNode) Utils.convertJsonToJackson(configuration, true);
         return withIOException(() -> withJsonPatchException(() -> {
             final var patchedConfigurationAsJson = JsonPatch.apply(patchContent, configurationAsJson);
+            JsonNode patch = JsonDiff.asJson(configurationAsJson, patchedConfigurationAsJson);
+            if (patch.isEmpty()) {
+                return ValidationResult.error(RestStatus.OK, payload(RestStatus.OK, "No updates required"));
+            }
             for (final var entityName : patchEntityNames(patchContent)) {
                 final var beforePatchEntity = configurationAsJson.get(entityName);
                 final var patchedEntity = patchedConfigurationAsJson.get(entityName);
-                // verify we can process exising or updated entities
+                // verify we can process existing or updated entities
                 if (beforePatchEntity != null && !Objects.equals(beforePatchEntity, patchedEntity)) {
                     final var checkEntityCanBeProcess = endpointValidator.isAllowedToChangeImmutableEntity(
                         SecurityConfiguration.of(entityName, configuration)
@@ -482,7 +487,7 @@ public abstract class AbstractApiAction extends BaseRestHandler {
             if (ExceptionsHelper.unwrapCause(e) instanceof VersionConflictEngineException) {
                 conflict(channel, e.getMessage());
             } else {
-                internalSeverError(channel, "Error " + e.getMessage());
+                internalServerError(channel, "Error " + e.getMessage());
             }
         }
 
@@ -579,7 +584,7 @@ public abstract class AbstractApiAction extends BaseRestHandler {
 
         // check if .opendistro_security index has been initialized
         if (!ensureIndexExists()) {
-            return channel -> internalSeverError(channel, RequestContentValidator.ValidationError.SECURITY_NOT_INITIALIZED.message());
+            return channel -> internalServerError(channel, RequestContentValidator.ValidationError.SECURITY_NOT_INITIALIZED.message());
         }
 
         // check if request is authorized

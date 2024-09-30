@@ -35,9 +35,10 @@ import java.util.Set;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 
-import org.opensearch.Version;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.security.auditlog.impl.AuditCategory;
+
+import com.password4j.types.Hmac;
 
 public class ConfigConstants {
 
@@ -145,6 +146,23 @@ public class ConfigConstants {
     public static final String SECURITY_AUTHCZ_IMPERSONATION_DN = "plugins.security.authcz.impersonation_dn";
     public static final String SECURITY_AUTHCZ_REST_IMPERSONATION_USERS = "plugins.security.authcz.rest_impersonation_user";
 
+    public static final String BCRYPT = "bcrypt";
+    public static final String PBKDF2 = "pbkdf2";
+
+    public static final String SECURITY_PASSWORD_HASHING_BCRYPT_ROUNDS = "plugins.security.password.hashing.bcrypt.rounds";
+    public static final int SECURITY_PASSWORD_HASHING_BCRYPT_ROUNDS_DEFAULT = 12;
+    public static final String SECURITY_PASSWORD_HASHING_BCRYPT_MINOR = "plugins.security.password.hashing.bcrypt.minor";
+    public static final String SECURITY_PASSWORD_HASHING_BCRYPT_MINOR_DEFAULT = "Y";
+
+    public static final String SECURITY_PASSWORD_HASHING_ALGORITHM = "plugins.security.password.hashing.algorithm";
+    public static final String SECURITY_PASSWORD_HASHING_ALGORITHM_DEFAULT = BCRYPT;
+    public static final String SECURITY_PASSWORD_HASHING_PBKDF2_ITERATIONS = "plugins.security.password.hashing.pbkdf2.iterations";
+    public static final int SECURITY_PASSWORD_HASHING_PBKDF2_ITERATIONS_DEFAULT = 600_000;
+    public static final String SECURITY_PASSWORD_HASHING_PBKDF2_LENGTH = "plugins.security.password.hashing.pbkdf2.length";
+    public static final int SECURITY_PASSWORD_HASHING_PBKDF2_LENGTH_DEFAULT = 256;
+    public static final String SECURITY_PASSWORD_HASHING_PBKDF2_FUNCTION = "plugins.security.password.hashing.pbkdf2.function";
+    public static final String SECURITY_PASSWORD_HASHING_PBKDF2_FUNCTION_DEFAULT = Hmac.SHA256.name();
+
     public static final String SECURITY_AUDIT_TYPE_DEFAULT = "plugins.security.audit.type";
     public static final String SECURITY_AUDIT_CONFIG_DEFAULT = "plugins.security.audit.config";
     public static final String SECURITY_AUDIT_CONFIG_ROUTES = "plugins.security.audit.routes";
@@ -172,6 +190,13 @@ public class ConfigConstants {
     public static final String OPENDISTRO_SECURITY_AUDIT_EXCLUDE_SENSITIVE_HEADERS = "opendistro_security.audit.exclude_sensitive_headers";
 
     public static final String SECURITY_AUDIT_CONFIG_DEFAULT_PREFIX = "plugins.security.audit.config.";
+
+    // Internal Opensearch data_stream
+    public static final String SECURITY_AUDIT_OPENSEARCH_DATASTREAM_NAME = "data_stream.name";
+    public static final String SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_MANAGE = "data_stream.template.manage";
+    public static final String SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_NAME = "data_stream.template.name";
+    public static final String SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_NUMBER_OF_REPLICAS = "data_stream.template.number_of_replicas";
+    public static final String SECURITY_AUDIT_OPENSEARCH_DATASTREAM_TEMPLATE_NUMBER_OF_SHARDS = "data_stream.template.number_of_shards";
 
     // Internal / External OpenSearch
     public static final String SECURITY_AUDIT_OPENSEARCH_INDEX = "index";
@@ -328,13 +353,13 @@ public class ConfigConstants {
     public static final Boolean SECURITY_SYSTEM_INDICES_PERMISSIONS_DEFAULT = false;
     public static final String SECURITY_SYSTEM_INDICES_KEY = "plugins.security.system_indices.indices";
     public static final List<String> SECURITY_SYSTEM_INDICES_DEFAULT = Collections.emptyList();
+    public static final String SECURITY_MASKED_FIELDS_ALGORITHM_DEFAULT = "plugins.security.masked_fields.algorithm.default";
 
     public static final String TENANCY_PRIVATE_TENANT_NAME = "private";
     public static final String TENANCY_GLOBAL_TENANT_NAME = "global";
     public static final String TENANCY_GLOBAL_TENANT_DEFAULT_NAME = "";
 
     public static final String USE_JDK_SERIALIZATION = "plugins.security.use_jdk_serialization";
-    public static final Version FIRST_CUSTOM_SERIALIZATION_SUPPORTED_OS_VERSION = Version.V_2_11_0;
 
     // On-behalf-of endpoints settings
     // CS-SUPPRESS-SINGLE: RegexpSingleline get Extensions Settings

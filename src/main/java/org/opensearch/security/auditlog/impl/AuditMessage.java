@@ -27,6 +27,8 @@ import java.util.regex.Pattern;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.hc.core5.net.URIBuilder;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.cluster.service.ClusterService;
@@ -59,6 +61,8 @@ import static org.opensearch.security.OpenSearchSecurityPlugin.PLUGINS_PREFIX;
 
 public final class AuditMessage {
 
+    private static final Logger log = LogManager.getLogger(AuditMessage.class);
+
     // clustername and cluster uuid
     private static final WildcardMatcher AUTHORIZATION_HEADER = WildcardMatcher.from("Authorization", false);
     private static final String SENSITIVE_KEY = "password";
@@ -69,8 +73,10 @@ public final class AuditMessage {
     );
 
     @VisibleForTesting
-    public static final Pattern BCRYPT_HASH = Pattern.compile("\\$2[ayb]\\$.{56}");
-    private static final String BCRYPT_HASH_REPLACEMENT_VALUE = "__HASH__";
+    public static final String BCRYPT_REGEX = "\\$2[ayb]\\$.{56}";
+    public static final String PBKDF2_REGEX = "\\$\\d+\\$\\d+\\$[A-Za-z0-9+/]+={0,2}\\$[A-Za-z0-9+/]+={0,2}";
+    public static final Pattern HASH_REGEX_PATTERN = Pattern.compile(BCRYPT_REGEX + "|" + PBKDF2_REGEX);
+    private static final String HASH_REPLACEMENT_VALUE = "__HASH__";
     private static final String INTERNALUSERS_DOC_ID = CType.INTERNALUSERS.toLCString();
 
     public static final String FORMAT_VERSION = "audit_format_version";
@@ -233,7 +239,7 @@ public final class AuditMessage {
 
     private String redactSecurityConfigContent(String content, String id) {
         if (content != null && INTERNALUSERS_DOC_ID.equals(id)) {
-            content = BCRYPT_HASH.matcher(content).replaceAll(BCRYPT_HASH_REPLACEMENT_VALUE);
+            content = HASH_REGEX_PATTERN.matcher(content).replaceAll(HASH_REPLACEMENT_VALUE);
         }
         return content;
     }
@@ -419,6 +425,7 @@ public final class AuditMessage {
                     }
                 } catch (Exception e) {
                     auditInfo.put(REQUEST_BODY, "ERROR: Unable to generate request body");
+                    log.error("Error while generating request body for audit log", e);
                 }
             }
         }

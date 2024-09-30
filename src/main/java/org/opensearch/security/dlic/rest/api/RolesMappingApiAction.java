@@ -106,14 +106,11 @@ public class RolesMappingApiAction extends AbstractApiAction {
             public ValidationResult<SecurityConfiguration> isAllowedToChangeRoleMappingWithRestAdminPermissions(
                 SecurityConfiguration securityConfiguration
             ) throws IOException {
-                return loadConfiguration(CType.ROLES, false, false).map(rolesConfiguration -> {
-                    if (isCurrentUserAdmin()) {
-                        return ValidationResult.success(securityConfiguration);
-                    }
-                    return isAllowedToChangeEntityWithRestAdminPermissions(
+                return loadConfiguration(CType.ROLES, false, false).map(
+                    rolesConfiguration -> isAllowedToChangeEntityWithRestAdminPermissions(
                         SecurityConfiguration.of(securityConfiguration.entityName(), rolesConfiguration)
-                    );
-                }).map(ignore -> ValidationResult.success(securityConfiguration));
+                    )
+                ).map(ignore -> ValidationResult.success(securityConfiguration));
             }
 
             @Override
@@ -131,13 +128,16 @@ public class RolesMappingApiAction extends AbstractApiAction {
 
                     @Override
                     public Set<String> mandatoryOrKeys() {
-                        return ImmutableSet.of("backend_roles", "and_backend_roles", "hosts", "users");
+                        return ImmutableSet.of("and_backend_roles", "backend_roles", "hosts", "users");
                     }
 
                     @Override
                     public Map<String, DataType> allowedKeys() {
                         final ImmutableMap.Builder<String, DataType> allowedKeys = ImmutableMap.builder();
-                        if (isCurrentUserAdmin()) allowedKeys.put("reserved", DataType.BOOLEAN);
+                        if (isCurrentUserAdmin()) {
+                            allowedKeys.put("hidden", DataType.BOOLEAN);
+                            allowedKeys.put("reserved", DataType.BOOLEAN);
+                        }
                         return allowedKeys.put("backend_roles", DataType.ARRAY)
                             .put("and_backend_roles", DataType.ARRAY)
                             .put("hosts", DataType.ARRAY)

@@ -18,7 +18,8 @@ import org.opensearch.security.securityconf.impl.v7.RoleV7;
 
 import org.mockito.Mockito;
 
-import static org.junit.Assert.assertEquals;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -28,21 +29,18 @@ public class RolesApiActionValidationTest extends AbstractApiActionValidationTes
 
     @Test
     public void isAllowedToChangeImmutableEntity() throws Exception {
-        when(restApiAdminPrivilegesEvaluator.isCurrentUserAdminFor(Endpoint.ROLES)).thenReturn(true);
-
         final var role = new RoleV7();
         role.setCluster_permissions(restApiAdminPermissions());
 
-        final var rolesApiActionEndpointValidator = new RolesApiAction(clusterService, threadPool, securityApiDependencies).createEndpointValidator();
-        final var result = rolesApiActionEndpointValidator.isAllowedToChangeImmutableEntity(SecurityConfiguration.of( "sss", configuration));
+        final var rolesApiActionEndpointValidator = new RolesApiAction(clusterService, threadPool, securityApiDependencies)
+            .createEndpointValidator();
+        final var result = rolesApiActionEndpointValidator.isAllowedToChangeImmutableEntity(SecurityConfiguration.of("sss", configuration));
 
         assertTrue(result.isValid());
     }
 
     @Test
     public void isNotAllowedRightsToChangeImmutableEntity() throws Exception {
-        when(restApiAdminPrivilegesEvaluator.isCurrentUserAdminFor(Endpoint.ROLES)).thenReturn(false);
-
         final var role = new RoleV7();
         role.setCluster_permissions(restApiAdminPermissions());
 
@@ -50,11 +48,12 @@ public class RolesApiActionValidationTest extends AbstractApiActionValidationTes
         Mockito.<Object>when(configuration.getCEntry("sss")).thenReturn(role);
 
         when(restApiAdminPrivilegesEvaluator.containsRestApiAdminPermissions(any(Object.class))).thenCallRealMethod();
-        final var rolesApiActionEndpointValidator = new RolesApiAction(clusterService, threadPool, securityApiDependencies).createEndpointValidator();
-        final var result = rolesApiActionEndpointValidator.isAllowedToChangeImmutableEntity(SecurityConfiguration.of( "sss", configuration));
+        final var rolesApiActionEndpointValidator = new RolesApiAction(clusterService, threadPool, securityApiDependencies)
+            .createEndpointValidator();
+        final var result = rolesApiActionEndpointValidator.isAllowedToChangeImmutableEntity(SecurityConfiguration.of("sss", configuration));
 
         assertFalse(result.isValid());
-        assertEquals(RestStatus.FORBIDDEN, result.status());
+        assertThat(result.status(), is(RestStatus.FORBIDDEN));
     }
 
 }

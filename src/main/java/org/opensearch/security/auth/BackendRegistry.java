@@ -28,10 +28,12 @@ package org.opensearch.security.auth;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.SortedSet;
@@ -44,6 +46,7 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.RemovalListener;
 import com.google.common.cache.RemovalNotification;
 import com.google.common.collect.Multimap;
+import org.apache.http.HttpHeaders;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -62,6 +65,7 @@ import org.opensearch.security.filter.SecurityResponse;
 import org.opensearch.security.http.XFFResolver;
 import org.opensearch.security.securityconf.DynamicConfigModel;
 import org.opensearch.security.support.ConfigConstants;
+import org.opensearch.security.support.WildcardMatcher;
 import org.opensearch.security.user.AuthCredentials;
 import org.opensearch.security.user.User;
 import org.opensearch.threadpool.ThreadPool;
@@ -82,6 +86,7 @@ public class BackendRegistry {
     private Multimap<String, AuthFailureListener> authBackendFailureListeners;
     private List<ClientBlockRegistry<InetAddress>> ipClientBlockRegistries;
     private Multimap<String, ClientBlockRegistry<String>> authBackendClientBlockRegistries;
+    private String hostResolverMode;
 
     private volatile boolean initialized;
     private volatile boolean injectedUserEnabled = false;
@@ -180,6 +185,7 @@ public class BackendRegistry {
         authBackendFailureListeners = dcm.getAuthBackendFailureListeners();
         ipClientBlockRegistries = dcm.getIpClientBlockRegistries();
         authBackendClientBlockRegistries = dcm.getAuthBackendClientBlockRegistries();
+        hostResolverMode = dcm.getHostsResolverMode();
 
         // OpenSearch Security no default authc
         initialized = !restAuthDomains.isEmpty() || anonymousAuthEnabled || injectedUserEnabled;
@@ -190,16 +196,20 @@ public class BackendRegistry {
      * @param request
      * @return The authenticated user, null means another roundtrip
      * @throws OpenSearchSecurityException
-     */
+    */
     public boolean authenticate(final SecurityRequestChannel request) {
         final boolean isDebugEnabled = log.isDebugEnabled();
         final boolean isBlockedBasedOnAddress = request.getRemoteAddress()
             .map(InetSocketAddress::getAddress)
-            .map(address -> isBlocked(address))
+            .map(this::isBlocked)
             .orElse(false);
         if (isBlockedBasedOnAddress) {
             if (isDebugEnabled) {
-                log.debug("Rejecting REST request because of blocked address: {}", request.getRemoteAddress().orElse(null));
+                InetSocketAddress ipAddress = request.getRemoteAddress().orElse(null);
+                log.debug(
+                    "Rejecting REST request because of blocked address: {}",
+                    ipAddress != null ? "/" + ipAddress.getAddress().getHostAddress() : null
+                );
             }
 
             request.queueForSending(new SecurityResponse(SC_UNAUTHORIZED, "Authentication finally failed"));
@@ -286,7 +296,7 @@ public class BackendRegistry {
 
             if (ac == null) {
                 // no credentials found in request
-                if (anonymousAuthEnabled) {
+                if (anonymousAuthEnabled && isRequestForAnonymousLogin(request.params(), request.getHeaders())) {
                     continue;
                 }
 
@@ -386,19 +396,6 @@ public class BackendRegistry {
                 log.debug("User still not authenticated after checking {} auth domains", restAuthDomains.size());
             }
 
-            if (authCredentials == null && anonymousAuthEnabled) {
-                final String tenant = resolveTenantFrom(request);
-                User anonymousUser = new User(User.ANONYMOUS.getName(), new HashSet<String>(User.ANONYMOUS.getRoles()), null);
-                anonymousUser.setRequestedTenant(tenant);
-
-                threadPool.getThreadContext().putTransient(ConfigConstants.OPENDISTRO_SECURITY_USER, anonymousUser);
-                auditLog.logSucceededLogin(anonymousUser.getName(), false, null, request);
-                if (isDebugEnabled) {
-                    log.debug("Anonymous User is authenticated");
-                }
-                return true;
-            }
-
             Optional<SecurityResponse> challengeResponse = Optional.empty();
 
             if (firstChallengingHttpAuthenticator != null) {
@@ -413,6 +410,19 @@ public class BackendRegistry {
                         log.debug("Rerequest {} failed", firstChallengingHttpAuthenticator.getClass());
                     }
                 }
+            }
+
+            if (authCredentials == null && anonymousAuthEnabled && isRequestForAnonymousLogin(request.params(), request.getHeaders())) {
+                final String tenant = resolveTenantFrom(request);
+                User anonymousUser = new User(User.ANONYMOUS.getName(), new HashSet<String>(User.ANONYMOUS.getRoles()), null);
+                anonymousUser.setRequestedTenant(tenant);
+
+                threadPool.getThreadContext().putTransient(ConfigConstants.OPENDISTRO_SECURITY_USER, anonymousUser);
+                auditLog.logSucceededLogin(anonymousUser.getName(), false, null, request);
+                if (isDebugEnabled) {
+                    log.debug("Anonymous User is authenticated");
+                }
+                return true;
             }
 
             log.warn(
@@ -430,6 +440,21 @@ public class BackendRegistry {
             return false;
         }
         return authenticated;
+    }
+
+    /**
+     * Checks if incoming auth request is from an anonymous user
+     * Defaults all requests to yes, to allow anonymous authentication to succeed
+     * @param params the query parameters passed in this request
+     * @return false only if an explicit `auth_type` param is supplied, and its value is not anonymous, OR
+     * if request contains no authorization headers
+     * otherwise returns true
+     */
+    private boolean isRequestForAnonymousLogin(Map<String, String> params, Map<String, List<String>> headers) {
+        if (params.containsKey("auth_type")) {
+            return params.get("auth_type").equals("anonymous");
+        }
+        return !headers.containsKey(HttpHeaders.AUTHORIZATION);
     }
 
     private String resolveTenantFrom(final SecurityRequest request) {
@@ -663,11 +688,32 @@ public class BackendRegistry {
         }
 
         for (ClientBlockRegistry<InetAddress> clientBlockRegistry : ipClientBlockRegistries) {
+            WildcardMatcher ignoreHostsMatcher = ((AuthFailureListener) clientBlockRegistry).getIgnoreHostsMatcher();
+            if (matchesHostPatterns(ignoreHostsMatcher, address, hostResolverMode)) {
+                return false;
+            }
             if (clientBlockRegistry.isBlocked(address)) {
                 return true;
             }
         }
 
+        return false;
+    }
+
+    public static boolean matchesHostPatterns(WildcardMatcher hostMatcher, InetAddress address, String hostResolverMode) {
+        if (hostMatcher == null) {
+            return false;
+        }
+        if (address != null) {
+            List<String> valuesToCheck = new ArrayList<>(List.of(address.getHostAddress()));
+            if (hostResolverMode != null
+                && (hostResolverMode.equalsIgnoreCase("ip-hostname") || hostResolverMode.equalsIgnoreCase("ip-hostname-lookup"))) {
+                final String hostName = address.getHostName();
+                valuesToCheck.add(hostName);
+            }
+
+            return valuesToCheck.stream().anyMatch(hostMatcher);
+        }
         return false;
     }
 
